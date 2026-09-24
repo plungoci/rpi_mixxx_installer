@@ -40,6 +40,10 @@
 #  libkeyfinder    absent din       >= 2.2.4                     CMake-ul Mixxx descarcă sursa oficială
 #                  Debian                                        mixxxdj/libkeyfinder, verificat SHA256
 #  ALSA/JACK/PA    1.2.x/1.9.x      portaudio19-dev + libjack    OK (PipeWire oferă API JACK/Pulse)
+#  GoogleTest      1.15.x           gtest/gtest_prod.h           NECESAR chiar fără teste: sursele Mixxx
+#                                                                (ex. src/mixer/playermanager.h) includ
+#                                                                gtest_prod.h -> libgtest-dev (găsit la
+#                                                                un build real de test)
 #
 #  Probleme cunoscute / adaptări:
 #   1. ARM64: singurul patch Debian legat de ARM (remove_inappropriate_arm_flags)
@@ -786,6 +790,7 @@ critical|libupower-glib-dev||UPower
 critical|libsqlite3-dev||SQLite3
 critical|zlib1g-dev||zlib
 critical|libssl-dev||OpenSSL
+critical|libgtest-dev||GoogleTest headers (gtest_prod.h e inclus de sursele Mixxx chiar cu BUILD_TESTING=OFF)
 optional|libmad0-dev||MAD (decoder MP3 alternativ)
 optional|libid3tag0-dev||ID3 tags
 optional|libfaad-dev||AAC (FAAD)
