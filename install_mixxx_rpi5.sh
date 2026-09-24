@@ -1092,9 +1092,19 @@ fetch_sources() {
 
     # Tag-urile se citesc din repository-ul oficial (doar citire)
     info "Interoghez tag-urile oficiale ${MIXXX_SERIES}.x..."
-    local remote_tags all_tags skipped
-    remote_tags="$(as_user git ls-remote --tags --refs "${MIXXX_REPO_URL}" "refs/tags/${MIXXX_SERIES}.*" 2>>"${LOG_FILE}")" \
-        || die "Nu pot contacta ${MIXXX_REPO_URL}." "Verifică rețeaua / DNS / proxy." "git ls-remote --tags ${MIXXX_REPO_URL}"
+    local remote_tags all_tags skipped git_err rc=0
+    git_err="$(mktemp)"
+    remote_tags="$(as_user git ls-remote --tags --refs "${MIXXX_REPO_URL}" "refs/tags/${MIXXX_SERIES}.*" 2>"${git_err}")" || rc=$?
+    if (( rc != 0 )); then
+        local reason; reason="$(tail -n 2 "${git_err}" | tr '\n' ' ')"
+        log_block "git ls-remote stderr" "${reason}"
+        rm -f -- "${git_err}"
+        FAILED_EXIT_CODE="${rc}"
+        die "Nu pot contacta ${MIXXX_REPO_URL}: ${reason:-eroare necunoscută}" \
+            "Verifică rețeaua, DNS, ora sistemului (certificatele TLS depind de ea) și pachetul ca-certificates." \
+            "git ls-remote --tags ${MIXXX_REPO_URL}"
+    fi
+    rm -f -- "${git_err}"
     all_tags="$(awk -F'refs/tags/' '{print $2}' <<<"${remote_tags}")"
     log_block "Tag-uri ${MIXXX_SERIES}.*" "${all_tags}"
     LATEST_TAG="$(filter_latest_stable_tag <<<"${all_tags}" || true)"
@@ -1458,10 +1468,13 @@ install_mixxx() {
         if [[ -f "${rules_dst}" ]] && cmp -s "${rules_src}" "${rules_dst}"; then
             ok "Regulile udev Mixxx sunt deja instalate."
         elif ask_yes_no "Instalez regulile udev Mixxx (acces la controllere HID/USB fără root) în ${rules_dst}?" "y"; then
-            run_root install -m 644 -- "${rules_src}" "${rules_dst}"
-            run_root udevadm control --reload-rules || true
-            run_root udevadm trigger --subsystem-match=usb --subsystem-match=hidraw || true
-            record "Reguli udev: ${rules_dst}"
+            if run_root install -D -m 644 -- "${rules_src}" "${rules_dst}"; then
+                run_root udevadm control --reload-rules || true
+                run_root udevadm trigger --subsystem-match=usb --subsystem-match=hidraw || true
+                record "Reguli udev: ${rules_dst}"
+            else
+                warn "Nu am putut instala regulile udev (vezi log); Mixxx funcționează, dar controllerele HID pot cere permisiuni."
+            fi
         else
             info "Regulile udev nu au fost instalate (controllerele HID pot necesita permisiuni)."
         fi
@@ -1944,4 +1957,6 @@ main() {
     final_report                          # 14
 }
 
-main "$@"
+# "exit" pe aceeași linie: bash nu mai citește din fișier după main, chiar dacă
+# scriptul este înlocuit (ex. git pull) în timp ce rulează.
+main "$@"; exit "$?"
