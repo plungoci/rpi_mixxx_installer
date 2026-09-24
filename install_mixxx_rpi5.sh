@@ -1120,7 +1120,8 @@ fetch_sources() {
     # Idempotență: dacă versiunea e deja instalată, nu se recompilează
     if [[ "${INSTALLED_VERSION}" == "${LATEST_TAG}" ]] && (( ! OPT_FORCE )); then
         ok "Mixxx ${LATEST_TAG} este deja instalat."
-        if (( ! OPT_DRY_RUN )) && ask_yes_no "Versiunea este deja cea mai nouă. Recompilezi totuși?" "n"; then
+        # --yes / --dry-run păstrează răspunsul implicit (nu): fără recompilare inutilă
+        if (( ! OPT_DRY_RUN && ! OPT_YES )) && ask_yes_no "Versiunea este deja cea mai nouă. Recompilezi totuși?" "n"; then
             NEED_BUILD=1
         else
             NEED_BUILD=0
@@ -1474,8 +1475,10 @@ install_mixxx() {
             ok "Regulile udev Mixxx sunt deja instalate."
         elif ask_yes_no "Instalez regulile udev Mixxx (acces la controllere HID/USB fără root) în ${rules_dst}?" "y"; then
             if run_root install -D -m 644 -- "${rules_src}" "${rules_dst}"; then
-                run_root udevadm control --reload-rules || true
-                run_root udevadm trigger --subsystem-match=usb --subsystem-match=hidraw || true
+                if need_cmd udevadm; then
+                    run_root udevadm control --reload-rules || true
+                    run_root udevadm trigger --subsystem-match=usb --subsystem-match=hidraw || true
+                fi
                 record "Reguli udev: ${rules_dst}"
             else
                 warn "Nu am putut instala regulile udev (vezi log); Mixxx funcționează, dar controllerele HID pot cere permisiuni."
@@ -1625,7 +1628,7 @@ detect_audio() {
     else
         AUDIO_PULSE="pactl neinstalat"
     fi
-    ok "PulseAudio: ${AUDIO_PULSE}"
+    if [[ "${AUDIO_PULSE}" == API* || "${AUDIO_PULSE}" == server* ]]; then ok "PulseAudio: ${AUDIO_PULSE}"; else info "PulseAudio: ${AUDIO_PULSE}"; fi
 
     # JACK (server jackd real sau API JACK prin pipewire-jack)
     if pgrep -x jackd >/dev/null 2>&1 || pgrep -x jackdbus >/dev/null 2>&1; then
@@ -1637,14 +1640,14 @@ detect_audio() {
     else
         AUDIO_JACK="indisponibil"
     fi
-    ok "JACK: ${AUDIO_JACK}"
+    if [[ "${AUDIO_JACK}" == "indisponibil" ]]; then info "JACK: ${AUDIO_JACK}"; else ok "JACK: ${AUDIO_JACK}"; fi
 
     if [[ "${pw_state}" == "active" ]]; then AUDIO_BACKEND="PipeWire"
     elif [[ "${AUDIO_PULSE}" == server* ]]; then AUDIO_BACKEND="PulseAudio"
     elif [[ "${AUDIO_JACK}" == "server jackd activ" ]]; then AUDIO_BACKEND="JACK"
     elif (( cards > 0 )); then AUDIO_BACKEND="ALSA (direct)"
     else AUDIO_BACKEND="niciunul"; fi
-    ok "Audio backend detected: ${AUDIO_BACKEND}"
+    if [[ "${AUDIO_BACKEND}" == "niciunul" ]]; then warn "Audio backend detected: niciunul"; else ok "Audio backend detected: ${AUDIO_BACKEND}"; fi
 
     # Accesul utilizatorului real la /dev/snd (grup audio sau ACL logind/uaccess)
     dev="$(compgen -G '/dev/snd/controlC*' | head -n1 || true)"
@@ -1695,8 +1698,13 @@ declare -rA DJ_VENDORS=(
 
 detect_controllers() {
     stage "ETAPA 11/14 — Controllere DJ și interfețe USB"
+    # Etapă doar de detectare: nicio comandă de aici nu are voie să oprească instalarea
     if need_cmd lsusb; then
-        info "lsusb:"; lsusb | sed 's/^/    /' | tee -a "${LOG_FILE}"
+        if out="$(lsusb 2>&1)"; then
+            info "lsusb:"; sed 's/^/    /' <<<"${out}"; log_block "lsusb" "${out}"
+        else
+            warn "lsusb a eșuat: ${out:-fără detalii} (magistrala USB nu este accesibilă?)"
+        fi
     else
         warn "lsusb lipsește (pachetul usbutils)."
     fi
