@@ -95,6 +95,8 @@ readonly MIN_FREE_DISK_GB=6
 readonly RECOMMENDED_FREE_DISK_GB=10
 readonly RAM_PER_JOB_MB=1500       # consum estimat per job de compilare C++/Qt
 readonly MAX_DEFAULT_JOBS=4        # Pi 5 are 4 nuclee: niciodată -j8 automat
+readonly AUTOSTART_FILE_NAME="mixxx-autostart.desktop"
+readonly AUTOSTART_DELAY=5         # secunde după login: PipeWire/sesiunea audio sunt pornite
 # libdjinterop 0.24.3 (descărcat de CMake-ul Mixxx) își forțează "-Werror". Pe aarch64,
 # GCC 14 dă un fals pozitiv -Wstringop-overflow în ext/date/date.h (std::reverse pe un
 # buffer local), deci build-ul eșuează doar pe ARM64 (reprodus: 16 erori pe aarch64,
@@ -108,6 +110,8 @@ readonly BUILD_CXXFLAGS="-Wno-error=stringop-overflow"
 OPT_NO_UPGRADE=0; OPT_SKIP_DEPS=0; OPT_SKIP_BUILD=0; OPT_FORCE=0
 OPT_DRY_RUN=0; OPT_VERBOSE=0; OPT_YES=0; OPT_JOBS=""; OPT_CONFIGURE_SWAP=0
 OPT_SYSTEM_INFO=0; OPT_CHECK_DEPS=0; OPT_NO_EXTERNAL=0
+OPT_AUTOSTART=""                   # "" | enable | disable  (--enable-/--disable-autostart)
+OPT_AUTOSTART_XWAYLAND=0           # --autostart-xwayland: pornire prin XWayland (QT_QPA_PLATFORM=xcb)
 READ_ONLY=0                        # 1 pentru --dry-run / --system-info / --check-dependencies
 
 # -----------------------------------------------------------------------------
@@ -358,6 +362,11 @@ Opțiuni:
   --verbose                Afișează ieșirea completă a comenzilor.
   -y, --yes                Răspunde 'da' la întrebări (NU pornește Mixxx automat).
 
+Pornire automată (nu reinstalează nimic, nu necesită root):
+  --enable-autostart       Mixxx pornește automat după login (XDG autostart în ~/.config/autostart).
+  --autostart-xwayland     Ca --enable-autostart, dar prin XWayland (QT_QPA_PLATFORM=xcb).
+  --disable-autostart      Dezactivează pornirea automată (șterge doar fișierul de autostart).
+
 Locații:
   Surse: ${SRC_DIR}    Build: ${BUILD_DIR}    Instalare: ${INSTALL_PREFIX}
   Log:   /var/log/mixxx-install.log (sau \$HOME/mixxx-install.log)
@@ -381,6 +390,9 @@ parse_args() {
             --force)              OPT_FORCE=1 ;;
             --configure-swap)     OPT_CONFIGURE_SWAP=1 ;;
             --no-external-downloads) OPT_NO_EXTERNAL=1 ;;
+            --enable-autostart)   OPT_AUTOSTART="enable" ;;
+            --autostart-xwayland) OPT_AUTOSTART="enable"; OPT_AUTOSTART_XWAYLAND=1 ;;
+            --disable-autostart)  OPT_AUTOSTART="disable" ;;
             --verbose|-v)         OPT_VERBOSE=1 ;;
             --yes|-y)             OPT_YES=1 ;;
             --jobs|-j)
@@ -429,11 +441,11 @@ setup_privileges() {
         SUDO=()                          # deja root: fără sudo
     elif need_cmd sudo; then
         SUDO=(sudo)
-        if (( ! READ_ONLY )); then
+        if (( ! READ_ONLY )) && [[ -z "${OPT_AUTOSTART}" ]]; then
             echo "[INFO] Unele etape (apt, instalare) necesită sudo."
             sudo -v || { echo "[ERROR] Autentificarea sudo a eșuat." >&2; EARLY_EXIT=1; exit 1; }
         fi
-    elif (( ! READ_ONLY )); then
+    elif (( ! READ_ONLY )) && [[ -z "${OPT_AUTOSTART}" ]]; then
         echo "[ERROR] Scriptul nu rulează ca root și 'sudo' nu este instalat." >&2
         echo "        -> Recomandare: su -c './${SCRIPT_NAME}'   sau instalează sudo." >&2
         EARLY_EXIT=1; exit 1
@@ -445,6 +457,10 @@ setup_logging() {
         # Modurile read-only nu scriu în /var/log; singurul fișier scris: log temporar în /tmp
         LOG_FILE="${TMPDIR:-/tmp}/mixxx-install-readonly-$(id -un).log"
         : >"${LOG_FILE}" 2>/dev/null || LOG_FILE="/dev/null"
+    elif [[ -n "${OPT_AUTOSTART}" ]] && (( EUID != 0 )); then
+        # Pornirea automată se configurează fără root: logul rămâne în home
+        LOG_FILE="${TARGET_HOME}/mixxx-install.log"
+        : >>"${LOG_FILE}" 2>/dev/null || LOG_FILE="/dev/null"
     else
         LOG_FILE="/var/log/mixxx-install.log"
         if ! { "${SUDO[@]}" touch "${LOG_FILE}" && "${SUDO[@]}" chown "$(id -u):$(id -g)" "${LOG_FILE}" \
@@ -1897,6 +1913,7 @@ final_verification() {
 
     if (( final_ok )); then
         printf '%sMixxx a fost instalat cu succes.%s  Pornire: mixxx  (sau din meniu: Sound & Video -> Mixxx)\n' "${C_GREEN}" "${C_RESET}"
+        info "Pornire automată la login: ./${SCRIPT_NAME} --enable-autostart"
     else
         die "Verificarea finală a eșuat." "Vezi mesajele de mai sus și ${LOG_FILE}." "verificare finală (which/file/ldd)"
     fi
@@ -2009,12 +2026,141 @@ final_report() {
 }
 
 # =============================================================================
+# Pornire automată (--enable-autostart / --autostart-xwayland / --disable-autostart)
+# =============================================================================
+# Folosește standardul XDG autostart (~/.config/autostart), respectat de GNOME, KDE,
+# XFCE, LXQt și de sesiunea labwc/wayfire din Raspberry Pi OS. Mixxx rulează ca
+# utilizator normal. Nu se modifică display manager-ul, auto-login-ul sau alte setări.
+
+# Desktop-ul sesiunii grafice a utilizatorului (ex. "LXDE-pi-labwc", "GNOME")
+user_desktop_name() {
+    local s d=""
+    if need_cmd loginctl; then
+        for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="${TARGET_USER}" '$3==u {print $1}' || true); do
+            d="$(loginctl show-session "${s}" -p Desktop --value 2>/dev/null || true)"
+            [[ -n "${d}" ]] && break
+        done
+    fi
+    printf '%s' "${d:-${XDG_CURRENT_DESKTOP:-}}"
+}
+
+# Utilizatorul configurat pentru auto-login (LightDM, GDM, SDDM, greetd), dacă există
+autologin_user() {
+    local u=""
+    u="$(grep -hsE '^[[:space:]]*autologin-user[[:space:]]*=' /etc/lightdm/lightdm.conf /etc/lightdm/lightdm.conf.d/*.conf 2>/dev/null \
+        | tail -n1 | cut -d= -f2- | tr -d '[:space:]' || true)"
+    if [[ -z "${u}" ]] && grep -qsE '^[[:space:]]*AutomaticLoginEnable[[:space:]]*=[[:space:]]*(true|True|1)' /etc/gdm3/daemon.conf 2>/dev/null; then
+        u="$(grep -hsE '^[[:space:]]*AutomaticLogin[[:space:]]*=' /etc/gdm3/daemon.conf | tail -n1 | cut -d= -f2- | tr -d '[:space:]' || true)"
+    fi
+    if [[ -z "${u}" ]]; then
+        u="$(awk -F= '/^\[Autologin\]/ {a=1; next} /^\[/ {a=0} a && $1 ~ /^[[:space:]]*User[[:space:]]*$/ {gsub(/[[:space:]]/, "", $2); print $2}' \
+            /etc/sddm.conf /etc/sddm.conf.d/*.conf 2>/dev/null | tail -n1 || true)"
+    fi
+    if [[ -z "${u}" && -r /etc/greetd/config.toml ]]; then
+        u="$(awk -F= '/^\[initial_session\]/ {a=1; next} /^\[/ {a=0} a && $1 ~ /^[[:space:]]*user[[:space:]]*$/ {gsub(/[[:space:]"]/, "", $2); print $2}' \
+            /etc/greetd/config.toml 2>/dev/null | tail -n1 || true)"
+    fi
+    printf '%s' "${u}"
+}
+
+configure_autostart() {
+    REPORT_DONE=1                          # mod scurt: fără raportul complet de instalare
+    stage "Pornire automată Mixxx (${OPT_AUTOSTART})"
+    [[ "${TARGET_USER}" != "root" ]] \
+        || die "Pornirea automată se configurează pentru un utilizator normal, nu pentru root." \
+               "Rulează ca utilizatorul desktop: ./${SCRIPT_NAME} --${OPT_AUTOSTART}-autostart" "detectare utilizator"
+
+    local dir="${TARGET_HOME}/.config/autostart"
+    local file="${dir}/${AUTOSTART_FILE_NAME}"
+
+    if [[ "${OPT_AUTOSTART}" == "disable" ]]; then
+        if [[ -f "${file}" ]]; then
+            run_user rm -f -- "${file}"
+            ok "Pornirea automată a fost dezactivată (șters: ${file})."
+        else
+            info "Pornirea automată nu era activă (${file} nu există)."
+        fi
+        return 0
+    fi
+
+    local bin="${INSTALL_PREFIX}/bin/mixxx"
+    if [[ ! -x "${bin}" ]] && (( ! OPT_DRY_RUN )); then
+        die "Mixxx nu este instalat în ${INSTALL_PREFIX}." "Instalează-l întâi: sudo ./${SCRIPT_NAME}" "test -x ${bin}"
+    fi
+    local run_cmd="${bin}" name="Mixxx"
+    if (( OPT_AUTOSTART_XWAYLAND )); then
+        run_cmd="env QT_QPA_PLATFORM=xcb ${bin}"
+        name="Mixxx (XWayland)"
+    fi
+
+    # Mic delay: la login, PipeWire și restul sesiunii audio pornesc în paralel cu autostart-ul
+    local content="[Desktop Entry]
+Type=Application
+Version=1.0
+Name=${name}
+Comment=Pornește Mixxx automat după login (creat de ${SCRIPT_NAME})
+Exec=sh -c \"sleep ${AUTOSTART_DELAY}; exec ${run_cmd}\"
+Icon=mixxx
+Terminal=false
+X-GNOME-Autostart-enabled=true"
+
+    if [[ -f "${file}" ]] && [[ "$(cat "${file}")" == "${content}" ]]; then
+        ok "Pornirea automată este deja configurată: ${file}"
+    elif (( OPT_DRY_RUN )); then
+        _print_dry "(ca ${TARGET_USER}) scriere ${file} (Exec=sh -c \"sleep ${AUTOSTART_DELAY}; exec ${run_cmd}\")"
+    else
+        run_user mkdir -p "${dir}"
+        LAST_RUN="tee ${file} (ca ${TARGET_USER})"
+        printf '%s\n' "${content}" | as_user tee "${file}" >/dev/null
+        if need_cmd desktop-file-validate && ! as_user desktop-file-validate "${file}" >>"${LOG_FILE}" 2>&1; then
+            warn "desktop-file-validate a raportat probleme pentru ${file} (vezi ${LOG_FILE})."
+        fi
+        ok "Pornire automată activată: ${file}"
+        ok "Comandă: ${run_cmd} (după ${AUTOSTART_DELAY} s de la login, ca ${TARGET_USER})"
+    fi
+
+    # Desktop-ul respectă XDG autostart? (labwc o face doar dacă îl rulează din autostart-ul său)
+    local desktop
+    desktop="$(user_desktop_name)"
+    info "Desktop detectat: ${desktop:-necunoscut (nicio sesiune grafică activă)}"
+    if [[ "${desktop,,}" == *labwc* ]]; then
+        if grep -qsE 'xdg-autostart|lxsession-xdg-autostart' /etc/xdg/labwc/autostart "${TARGET_HOME}/.config/labwc/autostart"; then
+            ok "labwc rulează aplicațiile XDG autostart."
+        else
+            warn "labwc nu pare să ruleze XDG autostart. Adaugă în ${TARGET_HOME}/.config/labwc/autostart linia: sh -c \"sleep ${AUTOSTART_DELAY}; exec ${run_cmd}\" &"
+        fi
+    fi
+
+    # Pornirea "la boot" necesită auto-login în desktop (doar verificare, nu modificăm nimic)
+    local auto
+    auto="$(autologin_user)"
+    if [[ "${auto}" == "${TARGET_USER}" ]]; then
+        ok "Auto-login activ pentru ${TARGET_USER}: Mixxx va porni automat la fiecare pornire a sistemului."
+    else
+        warn "Auto-login nu este activ pentru ${TARGET_USER}${auto:+ (configurat pentru: ${auto})}: Mixxx pornește după ce te autentifici în desktop."
+        if need_cmd raspi-config; then
+            hint "Pentru pornire directă la boot: sudo raspi-config -> System Options -> Boot / Auto Login -> Desktop Autologin"
+        else
+            hint "Pentru pornire directă la boot, activează auto-login în setările display manager-ului (LightDM/GDM/SDDM)."
+        fi
+    fi
+    info "Dezactivare: ./${SCRIPT_NAME} --disable-autostart"
+    record "Autostart ${OPT_AUTOSTART}: ${file}"
+    return 0
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 main() {
     parse_args "$@"
     setup_privileges
     setup_logging
+
+    if [[ -n "${OPT_AUTOSTART}" ]]; then  # doar pornirea automată: fără build/instalare
+        configure_autostart
+        return 0
+    fi
 
     detect_system                         # 1
     check_repositories                    # 2
