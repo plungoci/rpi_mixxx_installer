@@ -61,6 +61,9 @@
 #      are probleme cunoscute cu 16K, dar valoarea este logată pentru depanare.
 #   6. /opt/mixxx-source aparține utilizatorului real; compilarea rulează ca
 #      acel utilizator (NU root). Doar apt și "cmake --install" folosesc root.
+#   7. libdjinterop 0.24.3 + GCC 14 pe aarch64: fals pozitiv -Wstringop-overflow
+#      transformat în eroare de "-Werror"-ul proiectului (găsit pe un Pi 5 real).
+#      Build-ul rulează cu CXXFLAGS=-Wno-error=stringop-overflow (vezi BUILD_CXXFLAGS).
 #
 #  Etape:
 #    1 Detectare sistem   6 Configurare build   11 Controllere USB DJ
@@ -92,6 +95,12 @@ readonly MIN_FREE_DISK_GB=6
 readonly RECOMMENDED_FREE_DISK_GB=10
 readonly RAM_PER_JOB_MB=1500       # consum estimat per job de compilare C++/Qt
 readonly MAX_DEFAULT_JOBS=4        # Pi 5 are 4 nuclee: niciodată -j8 automat
+# libdjinterop 0.24.3 (descărcat de CMake-ul Mixxx) își forțează "-Werror". Pe aarch64,
+# GCC 14 dă un fals pozitiv -Wstringop-overflow în ext/date/date.h (std::reverse pe un
+# buffer local), deci build-ul eșuează doar pe ARM64 (reprodus: 16 erori pe aarch64,
+# 0 pe x86_64). Avertismentul rămâne vizibil, dar nu mai este fatal. Sub-proiectele
+# ExternalProject preiau CXXFLAGS din mediu la prima configurare.
+readonly BUILD_CXXFLAGS="-Wno-error=stringop-overflow"
 
 # -----------------------------------------------------------------------------
 # Opțiuni
@@ -1378,14 +1387,35 @@ configure_build() {
     log_block "Configurare CMake" "cmake ${args[*]}"
 
     run_user mkdir -p "${BUILD_DIR}"
-    info "Rulez CMake (ca ${TARGET_USER})..."
-    if ! run_user cmake "${args[@]}"; then
+    reset_stale_external_projects
+    info "Rulez CMake (ca ${TARGET_USER}, CXXFLAGS=${BUILD_CXXFLAGS})..."
+    if ! run_user env CXXFLAGS="${BUILD_CXXFLAGS}" cmake "${args[@]}"; then
         show_log_tail 80
         die "Configurarea CMake a eșuat; ${BUILD_DIR} a fost păstrat." \
             "Caută 'Could NOT find' / 'CMake Error' în log; verifică: ./${SCRIPT_NAME} --check-dependencies"
     fi
     ok "CMake configurat."
     record "CMake: Release, OPTIMIZE=portable, prefix ${INSTALL_PREFIX}, generator ${CMAKE_GENERATOR}"
+}
+
+# Sub-proiectele descărcate de CMake-ul Mixxx (libdjinterop, libkeyfinder) sunt configurate
+# o singură dată; CXXFLAGS din mediu nu se mai aplică unei configurări existente.
+# Dacă un astfel de sub-proiect a fost configurat fără BUILD_CXXFLAGS (ex. build eșuat
+# anterior), îi ștergem DOAR directorul din build/, ca să fie reconfigurat. Arhiva
+# descărcată (build/downloads) și restul build-ului rămân neatinse.
+reset_stale_external_projects() {
+    local d cache
+    for d in "${BUILD_DIR}"/libdjinterop-*; do
+        [[ -d "${d}" ]] || continue
+        cache="$(compgen -G "${d}/src/*-build/CMakeCache.txt" | head -n1 || true)"
+        [[ -n "${cache}" ]] || continue
+        if ! grep -q -- "${BUILD_CXXFLAGS}" "${cache}"; then
+            info "Sub-proiectul $(basename "${d}") a fost configurat fără ${BUILD_CXXFLAGS}; îl reconfigurez."
+            safe_rm_dir "${d}" "${BUILD_DIR}"
+            record "Reconfigurat sub-proiectul $(basename "${d}") (fix -Wstringop-overflow aarch64)"
+        fi
+    done
+    return 0
 }
 
 show_log_tail() {
@@ -1407,7 +1437,7 @@ build_mixxx() {
 
     info "Compilez Mixxx ${LATEST_TAG} (Release, -j${BUILD_JOBS}, ca ${TARGET_USER}); pe Pi 5 durează ~40–90 min."
     if (( READ_ONLY )); then
-        run_user cmake --build "${BUILD_DIR}" --parallel "${BUILD_JOBS}"
+        run_user env CXXFLAGS="${BUILD_CXXFLAGS}" cmake --build "${BUILD_DIR}" --parallel "${BUILD_JOBS}"
         BUILD_RESULT="simulat"; return 0
     fi
 
@@ -1418,7 +1448,7 @@ build_mixxx() {
     log_raw "[RUN] ${LAST_RUN}"
     # Log complet în fișier; în terminal doar progresul ([ 42%] sau [123/2000]) și erorile.
     # Cu pipefail, "|| rc=$?" preia codul lui cmake (tee/awk nu eșuează).
-    as_user cmake --build "${BUILD_DIR}" --parallel "${BUILD_JOBS}" 2>&1 \
+    as_user env CXXFLAGS="${BUILD_CXXFLAGS}" cmake --build "${BUILD_DIR}" --parallel "${BUILD_JOBS}" 2>&1 \
         | tee -a "${LOG_FILE}" \
         | awk -v verbose="${OPT_VERBOSE}" -v tty="${tty}" '
             verbose == 1 { print; fflush(); next }
