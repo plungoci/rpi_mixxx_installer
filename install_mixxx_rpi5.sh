@@ -61,6 +61,9 @@
 #      are probleme cunoscute cu 16K, dar valoarea este logată pentru depanare.
 #   6. /opt/mixxx-source aparține utilizatorului real; compilarea rulează ca
 #      acel utilizator (NU root). Doar apt și "cmake --install" folosesc root.
+#   7. libdjinterop 0.24.3 + GCC 14 pe aarch64: fals pozitiv -Wstringop-overflow
+#      transformat în eroare de "-Werror"-ul proiectului (găsit pe un Pi 5 real).
+#      Build-ul rulează cu CXXFLAGS=-Wno-error=stringop-overflow (vezi BUILD_CXXFLAGS).
 #
 #  Etape:
 #    1 Detectare sistem   6 Configurare build   11 Controllere USB DJ
@@ -92,6 +95,12 @@ readonly MIN_FREE_DISK_GB=6
 readonly RECOMMENDED_FREE_DISK_GB=10
 readonly RAM_PER_JOB_MB=1500       # consum estimat per job de compilare C++/Qt
 readonly MAX_DEFAULT_JOBS=4        # Pi 5 are 4 nuclee: niciodată -j8 automat
+# libdjinterop 0.24.3 (descărcat de CMake-ul Mixxx) își forțează "-Werror". Pe aarch64,
+# GCC 14 dă un fals pozitiv -Wstringop-overflow în ext/date/date.h (std::reverse pe un
+# buffer local), deci build-ul eșuează doar pe ARM64 (reprodus: 16 erori pe aarch64,
+# 0 pe x86_64). Avertismentul rămâne vizibil, dar nu mai este fatal. Sub-proiectele
+# ExternalProject preiau CXXFLAGS din mediu la prima configurare.
+readonly BUILD_CXXFLAGS="-Wno-error=stringop-overflow"
 
 # -----------------------------------------------------------------------------
 # Opțiuni
@@ -670,12 +679,51 @@ check_repositories() {
 # =============================================================================
 # ETAPA 3 — Actualizarea sistemului
 # =============================================================================
+# Rulează apt-get cu privilegii root:
+#  - așteaptă până la 5 minute dacă lock-ul dpkg/apt e ținut de alt proces
+#    (pe desktop, PackageKit / unattended-upgrades verifică actualizări în fundal);
+#  - la eșec, reține în APT_ERRORS liniile relevante din ieșirea apt.
+readonly APT_LOCK_TIMEOUT=300
+APT_ERRORS=""
+run_apt() {
+    local start=0
+    APT_ERRORS=""
+    [[ -r "${LOG_FILE}" ]] && start="$(wc -l <"${LOG_FILE}")"
+    if run_root apt-get -o DPkg::Lock::Timeout="${APT_LOCK_TIMEOUT}" "$@"; then return 0; fi
+    APT_ERRORS="$(tail -n +"$(( start + 1 ))" "${LOG_FILE}" 2>/dev/null \
+        | grep -E '^(E|W): |dpkg: error|dpkg: dependency problems|Errors were encountered|^ [^ ].* : Depends:' \
+        | tail -n 12 || true)"
+    return 1
+}
+
+# Afișează erorile apt reținute și o recomandare potrivită cauzei
+explain_apt_failure() {
+    if [[ -n "${APT_ERRORS}" ]]; then
+        error "Mesajele apt:"
+        while IFS= read -r line; do error "    ${line}"; done <<<"${APT_ERRORS}"
+    else
+        error "apt nu a afișat un mesaj E:/W:. Vezi ultimele linii din ${LOG_FILE}."
+    fi
+    if grep -qiE 'lock|Could not get lock|is held by process' <<<"${APT_ERRORS}"; then
+        hint "Alt program folosește apt (PackageKit / Software Updater / unattended-upgrades). Așteaptă să termine sau închide-l, apoi rulează din nou."
+    elif grep -qiE 'dpkg was interrupted|dpkg --configure -a' <<<"${APT_ERRORS}"; then
+        hint "Rulează: sudo dpkg --configure -a"
+    elif grep -qiE 'Temporary failure|Could not resolve|Failed to fetch|Connection' <<<"${APT_ERRORS}"; then
+        hint "Problemă de rețea / mirror: verifică conexiunea și rulează din nou."
+    elif grep -qiE 'Depends:|unmet dependencies|held broken' <<<"${APT_ERRORS}"; then
+        hint "Dependențe nerezolvate: rulează 'sudo apt -f install' și verifică sursele APT (etapa 2)."
+    fi
+}
+
 update_system() {
     stage "ETAPA 3/14 — Actualizarea sistemului"
     export DEBIAN_FRONTEND=noninteractive
+    info "Dacă apt este ocupat de alt program (ex. PackageKit), aștept până la $(( APT_LOCK_TIMEOUT / 60 )) minute eliberarea lock-ului."
     info "apt update..."
-    run_root apt-get update \
-        || die "'apt update' a eșuat (Debian ${DEBIAN_VERSION_FULL})." "Verifică rețeaua și sursele APT (etapa 2), apoi: sudo apt update"
+    if ! run_apt update; then
+        explain_apt_failure
+        die "'apt update' a eșuat (Debian ${DEBIAN_VERSION_FULL})." "Verifică rețeaua și sursele APT (etapa 2), apoi: sudo apt update"
+    fi
     record "apt update"
 
     local upgradable
@@ -686,11 +734,23 @@ update_system() {
         warn "${upgradable} pachete pot fi actualizate (--no-upgrade activ)."
     else
         info "${upgradable} pachete de actualizat: apt full-upgrade..."
-        run_root apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold full-upgrade \
-            || die "'apt full-upgrade' a eșuat (Debian ${DEBIAN_VERSION_FULL})." \
-                   "Rulează 'sudo dpkg --configure -a' și 'sudo apt -f install', apoi repornește scriptul."
-        ok "Sistem actualizat (${upgradable} pachete)."
-        record "apt full-upgrade (${upgradable} pachete)"
+        if run_apt -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold full-upgrade; then
+            ok "Sistem actualizat (${upgradable} pachete)."
+            record "apt full-upgrade (${upgradable} pachete)"
+        else
+            local upgrade_cmd="${LAST_RUN}"
+            error "'apt full-upgrade' a eșuat (Debian ${DEBIAN_VERSION_FULL})."
+            explain_apt_failure
+            # Actualizarea sistemului nu este strict necesară pentru build: utilizatorul decide
+            if ask_yes_no "Continui instalarea Mixxx fără 'apt full-upgrade'? (N = opresc; poți rula ulterior cu --no-upgrade)" "n"; then
+                warn "apt full-upgrade a eșuat și a fost sărit la cererea utilizatorului."
+                record "apt full-upgrade EȘUAT — sărit la cererea utilizatorului"
+            else
+                die "'apt full-upgrade' a eșuat (Debian ${DEBIAN_VERSION_FULL})." \
+                    "Rezolvă cauza de mai sus și rulează din nou, sau: sudo ./${SCRIPT_NAME} --no-upgrade" \
+                    "${upgrade_cmd}"
+            fi
+        fi
     fi
     check_reboot_required
 }
@@ -1035,11 +1095,10 @@ install_dependencies() {
     (( OPT_CHECK_DEPS )) && return 0
 
     export DEBIAN_FRONTEND=noninteractive
-    if ! run_root apt-get install -y --no-install-recommends -- "${DEPS_TO_INSTALL[@]}"; then
-        local reason
-        reason="$(grep -E '^E: ' "${LOG_FILE}" | tail -n 3 | tr '\n' ' ' || true)"
-        die "Instalarea dependențelor a eșuat (Debian ${DEBIAN_VERSION_FULL}): ${reason:-vezi logul}" \
-            "Rulează 'sudo dpkg --configure -a && sudo apt -f install', apoi repornește scriptul."
+    if ! run_apt install -y --no-install-recommends -- "${DEPS_TO_INSTALL[@]}"; then
+        explain_apt_failure
+        die "Instalarea dependențelor a eșuat (Debian ${DEBIAN_VERSION_FULL})." \
+            "Rezolvă cauza de mai sus (ex. 'sudo dpkg --configure -a && sudo apt -f install'), apoi repornește scriptul."
     fi
     # Verificare post-instalare: fiecare pachet trebuie să fie efectiv instalat
     if (( ! READ_ONLY )); then
@@ -1328,14 +1387,35 @@ configure_build() {
     log_block "Configurare CMake" "cmake ${args[*]}"
 
     run_user mkdir -p "${BUILD_DIR}"
-    info "Rulez CMake (ca ${TARGET_USER})..."
-    if ! run_user cmake "${args[@]}"; then
+    reset_stale_external_projects
+    info "Rulez CMake (ca ${TARGET_USER}, CXXFLAGS=${BUILD_CXXFLAGS})..."
+    if ! run_user env CXXFLAGS="${BUILD_CXXFLAGS}" cmake "${args[@]}"; then
         show_log_tail 80
         die "Configurarea CMake a eșuat; ${BUILD_DIR} a fost păstrat." \
             "Caută 'Could NOT find' / 'CMake Error' în log; verifică: ./${SCRIPT_NAME} --check-dependencies"
     fi
     ok "CMake configurat."
     record "CMake: Release, OPTIMIZE=portable, prefix ${INSTALL_PREFIX}, generator ${CMAKE_GENERATOR}"
+}
+
+# Sub-proiectele descărcate de CMake-ul Mixxx (libdjinterop, libkeyfinder) sunt configurate
+# o singură dată; CXXFLAGS din mediu nu se mai aplică unei configurări existente.
+# Dacă un astfel de sub-proiect a fost configurat fără BUILD_CXXFLAGS (ex. build eșuat
+# anterior), îi ștergem DOAR directorul din build/, ca să fie reconfigurat. Arhiva
+# descărcată (build/downloads) și restul build-ului rămân neatinse.
+reset_stale_external_projects() {
+    local d cache
+    for d in "${BUILD_DIR}"/libdjinterop-*; do
+        [[ -d "${d}" ]] || continue
+        cache="$(compgen -G "${d}/src/*-build/CMakeCache.txt" | head -n1 || true)"
+        [[ -n "${cache}" ]] || continue
+        if ! grep -q -- "${BUILD_CXXFLAGS}" "${cache}"; then
+            info "Sub-proiectul $(basename "${d}") a fost configurat fără ${BUILD_CXXFLAGS}; îl reconfigurez."
+            safe_rm_dir "${d}" "${BUILD_DIR}"
+            record "Reconfigurat sub-proiectul $(basename "${d}") (fix -Wstringop-overflow aarch64)"
+        fi
+    done
+    return 0
 }
 
 show_log_tail() {
@@ -1357,7 +1437,7 @@ build_mixxx() {
 
     info "Compilez Mixxx ${LATEST_TAG} (Release, -j${BUILD_JOBS}, ca ${TARGET_USER}); pe Pi 5 durează ~40–90 min."
     if (( READ_ONLY )); then
-        run_user cmake --build "${BUILD_DIR}" --parallel "${BUILD_JOBS}"
+        run_user env CXXFLAGS="${BUILD_CXXFLAGS}" cmake --build "${BUILD_DIR}" --parallel "${BUILD_JOBS}"
         BUILD_RESULT="simulat"; return 0
     fi
 
@@ -1368,7 +1448,7 @@ build_mixxx() {
     log_raw "[RUN] ${LAST_RUN}"
     # Log complet în fișier; în terminal doar progresul ([ 42%] sau [123/2000]) și erorile.
     # Cu pipefail, "|| rc=$?" preia codul lui cmake (tee/awk nu eșuează).
-    as_user cmake --build "${BUILD_DIR}" --parallel "${BUILD_JOBS}" 2>&1 \
+    as_user env CXXFLAGS="${BUILD_CXXFLAGS}" cmake --build "${BUILD_DIR}" --parallel "${BUILD_JOBS}" 2>&1 \
         | tee -a "${LOG_FILE}" \
         | awk -v verbose="${OPT_VERBOSE}" -v tty="${tty}" '
             verbose == 1 { print; fflush(); next }
