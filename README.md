@@ -44,6 +44,18 @@ sudo ./install_mixxx_rpi5.sh                   # install
 | `--no-external-downloads` | Disable Engine Prime export and KeyFinder (see notes) |
 | `--verbose` | Show full command output |
 | `-y`, `--yes` | Answer yes to prompts (Mixxx is never launched automatically) |
+| `--enable-autostart` | Start Mixxx automatically after login (no rebuild, no root needed) |
+| `--autostart-xwayland` | Same, but start Mixxx through XWayland (`QT_QPA_PLATFORM=xcb`) |
+| `--disable-autostart` | Turn autostart off again |
+
+## Autostart
+
+```bash
+./install_mixxx_rpi5.sh --enable-autostart     # or --autostart-xwayland
+./install_mixxx_rpi5.sh --disable-autostart
+```
+
+This writes `~/.config/autostart/mixxx-autostart.desktop`, the standard XDG autostart location, for your user. Mixxx starts 5 seconds after you log in, so that PipeWire is already running. To have Mixxx start at boot without logging in, turn on desktop auto-login, for example with `sudo raspi-config` → System Options → Boot / Auto Login. The script checks whether auto-login is on but never changes it.
 
 ## Paths
 
