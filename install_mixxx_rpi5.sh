@@ -670,12 +670,51 @@ check_repositories() {
 # =============================================================================
 # ETAPA 3 — Actualizarea sistemului
 # =============================================================================
+# Rulează apt-get cu privilegii root:
+#  - așteaptă până la 5 minute dacă lock-ul dpkg/apt e ținut de alt proces
+#    (pe desktop, PackageKit / unattended-upgrades verifică actualizări în fundal);
+#  - la eșec, reține în APT_ERRORS liniile relevante din ieșirea apt.
+readonly APT_LOCK_TIMEOUT=300
+APT_ERRORS=""
+run_apt() {
+    local start=0
+    APT_ERRORS=""
+    [[ -r "${LOG_FILE}" ]] && start="$(wc -l <"${LOG_FILE}")"
+    if run_root apt-get -o DPkg::Lock::Timeout="${APT_LOCK_TIMEOUT}" "$@"; then return 0; fi
+    APT_ERRORS="$(tail -n +"$(( start + 1 ))" "${LOG_FILE}" 2>/dev/null \
+        | grep -E '^(E|W): |dpkg: error|dpkg: dependency problems|Errors were encountered|^ [^ ].* : Depends:' \
+        | tail -n 12 || true)"
+    return 1
+}
+
+# Afișează erorile apt reținute și o recomandare potrivită cauzei
+explain_apt_failure() {
+    if [[ -n "${APT_ERRORS}" ]]; then
+        error "Mesajele apt:"
+        while IFS= read -r line; do error "    ${line}"; done <<<"${APT_ERRORS}"
+    else
+        error "apt nu a afișat un mesaj E:/W:. Vezi ultimele linii din ${LOG_FILE}."
+    fi
+    if grep -qiE 'lock|Could not get lock|is held by process' <<<"${APT_ERRORS}"; then
+        hint "Alt program folosește apt (PackageKit / Software Updater / unattended-upgrades). Așteaptă să termine sau închide-l, apoi rulează din nou."
+    elif grep -qiE 'dpkg was interrupted|dpkg --configure -a' <<<"${APT_ERRORS}"; then
+        hint "Rulează: sudo dpkg --configure -a"
+    elif grep -qiE 'Temporary failure|Could not resolve|Failed to fetch|Connection' <<<"${APT_ERRORS}"; then
+        hint "Problemă de rețea / mirror: verifică conexiunea și rulează din nou."
+    elif grep -qiE 'Depends:|unmet dependencies|held broken' <<<"${APT_ERRORS}"; then
+        hint "Dependențe nerezolvate: rulează 'sudo apt -f install' și verifică sursele APT (etapa 2)."
+    fi
+}
+
 update_system() {
     stage "ETAPA 3/14 — Actualizarea sistemului"
     export DEBIAN_FRONTEND=noninteractive
+    info "Dacă apt este ocupat de alt program (ex. PackageKit), aștept până la $(( APT_LOCK_TIMEOUT / 60 )) minute eliberarea lock-ului."
     info "apt update..."
-    run_root apt-get update \
-        || die "'apt update' a eșuat (Debian ${DEBIAN_VERSION_FULL})." "Verifică rețeaua și sursele APT (etapa 2), apoi: sudo apt update"
+    if ! run_apt update; then
+        explain_apt_failure
+        die "'apt update' a eșuat (Debian ${DEBIAN_VERSION_FULL})." "Verifică rețeaua și sursele APT (etapa 2), apoi: sudo apt update"
+    fi
     record "apt update"
 
     local upgradable
@@ -686,11 +725,23 @@ update_system() {
         warn "${upgradable} pachete pot fi actualizate (--no-upgrade activ)."
     else
         info "${upgradable} pachete de actualizat: apt full-upgrade..."
-        run_root apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold full-upgrade \
-            || die "'apt full-upgrade' a eșuat (Debian ${DEBIAN_VERSION_FULL})." \
-                   "Rulează 'sudo dpkg --configure -a' și 'sudo apt -f install', apoi repornește scriptul."
-        ok "Sistem actualizat (${upgradable} pachete)."
-        record "apt full-upgrade (${upgradable} pachete)"
+        if run_apt -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold full-upgrade; then
+            ok "Sistem actualizat (${upgradable} pachete)."
+            record "apt full-upgrade (${upgradable} pachete)"
+        else
+            local upgrade_cmd="${LAST_RUN}"
+            error "'apt full-upgrade' a eșuat (Debian ${DEBIAN_VERSION_FULL})."
+            explain_apt_failure
+            # Actualizarea sistemului nu este strict necesară pentru build: utilizatorul decide
+            if ask_yes_no "Continui instalarea Mixxx fără 'apt full-upgrade'? (N = opresc; poți rula ulterior cu --no-upgrade)" "n"; then
+                warn "apt full-upgrade a eșuat și a fost sărit la cererea utilizatorului."
+                record "apt full-upgrade EȘUAT — sărit la cererea utilizatorului"
+            else
+                die "'apt full-upgrade' a eșuat (Debian ${DEBIAN_VERSION_FULL})." \
+                    "Rezolvă cauza de mai sus și rulează din nou, sau: sudo ./${SCRIPT_NAME} --no-upgrade" \
+                    "${upgrade_cmd}"
+            fi
+        fi
     fi
     check_reboot_required
 }
@@ -1035,11 +1086,10 @@ install_dependencies() {
     (( OPT_CHECK_DEPS )) && return 0
 
     export DEBIAN_FRONTEND=noninteractive
-    if ! run_root apt-get install -y --no-install-recommends -- "${DEPS_TO_INSTALL[@]}"; then
-        local reason
-        reason="$(grep -E '^E: ' "${LOG_FILE}" | tail -n 3 | tr '\n' ' ' || true)"
-        die "Instalarea dependențelor a eșuat (Debian ${DEBIAN_VERSION_FULL}): ${reason:-vezi logul}" \
-            "Rulează 'sudo dpkg --configure -a && sudo apt -f install', apoi repornește scriptul."
+    if ! run_apt install -y --no-install-recommends -- "${DEPS_TO_INSTALL[@]}"; then
+        explain_apt_failure
+        die "Instalarea dependențelor a eșuat (Debian ${DEBIAN_VERSION_FULL})." \
+            "Rezolvă cauza de mai sus (ex. 'sudo dpkg --configure -a && sudo apt -f install'), apoi repornește scriptul."
     fi
     # Verificare post-instalare: fiecare pachet trebuie să fie efectiv instalat
     if (( ! READ_ONLY )); then
