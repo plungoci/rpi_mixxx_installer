@@ -57,6 +57,24 @@ sudo ./install_mixxx_rpi5.sh                   # install
 
 This writes `~/.config/autostart/mixxx-autostart.desktop`, the standard XDG autostart location, for your user. Mixxx starts 5 seconds after you log in, so that PipeWire is already running. To have Mixxx start at boot without logging in, turn on desktop auto-login, for example with `sudo raspi-config` → System Options → Boot / Auto Login. The script checks whether auto-login is on but never changes it.
 
+## Boot splash screen
+
+`setup_boot_splash.sh` replaces the boot text with a custom image:
+
+```bash
+sudo ./setup_boot_splash.sh                     # uses assets/splash.png
+sudo ./setup_boot_splash.sh --image my-logo.png # any PNG
+./setup_boot_splash.sh --dry-run                # show changes only
+sudo ./setup_boot_splash.sh --revert            # undo everything
+```
+
+It changes three things:
+- **Plymouth:** installs Plymouth and adds a theme that centres the image, scaled to fit, on a black background.
+- **`cmdline.txt`:** adds `quiet splash loglevel=3 logo.nologo vt.global_cursor_default=0` and moves the console from `tty1` to `tty3`, so boot messages are hidden but still logged.
+- **`config.txt`:** sets `disable_splash=1`, which removes the rainbow screen.
+
+The original files are backed up once in `/var/lib/mixxx-installer/splash`, and `--revert` restores them. Reboot to see the change.
+
 ## Paths
 
 | | |
