@@ -32,6 +32,7 @@ readonly SCRIPT_DIR
 readonly -a CMDLINE_ADD=(quiet splash loglevel=3 logo.nologo vt.global_cursor_default=0 plymouth.ignore-serial-consoles)
 
 OPT_DRY_RUN=0; OPT_REVERT=0; OPT_YES=0
+OPT_ROTATE=0                        # rotire în sensul acelor de ceasornic: 0, 90, 180, 270
 IMAGE="${SCRIPT_DIR}/assets/splash.png"
 BOOT_DIR=""
 
@@ -72,10 +73,12 @@ ${SCRIPT_NAME} — splash screen la pornire + ascunderea textului de boot
 Utilizare:
   sudo ./${SCRIPT_NAME}                 activează (imagine: assets/splash.png)
   sudo ./${SCRIPT_NAME} --image FILE    activează cu altă imagine PNG
+  sudo ./${SCRIPT_NAME} --rotate 90     imaginea rotită (ex. ecran montat altfel decât nativ)
   sudo ./${SCRIPT_NAME} --revert        revine la configurația de dinainte
   ./${SCRIPT_NAME} --dry-run            arată ce s-ar schimba, fără modificări
 
-Opțiuni: --image FILE, --dry-run, --revert, -y/--yes, --help
+Opțiuni: --image FILE, --rotate 0|90|180|270 (sensul acelor de ceasornic),
+         --dry-run, --revert, -y/--yes, --help
 Modificările devin vizibile după repornire (sudo reboot).
 EOF
 }
@@ -89,6 +92,8 @@ parse_args() {
             --yes|-y)   OPT_YES=1 ;;
             --image)    [[ $# -ge 2 ]] || die "--image necesită o cale către un fișier PNG"; IMAGE="$2"; shift ;;
             --image=*)  IMAGE="${1#*=}" ;;
+            --rotate)   [[ $# -ge 2 ]] || die "--rotate necesită 0, 90, 180 sau 270"; OPT_ROTATE="$2"; shift ;;
+            --rotate=*) OPT_ROTATE="${1#*=}" ;;
             *)          die "Opțiune necunoscută: $1" "Vezi: ./${SCRIPT_NAME} --help" ;;
         esac
         shift
@@ -195,10 +200,37 @@ set_theme() {
     write_file "${PLYMOUTHD_CONF}" "${content}" 644
 }
 
+# Rotirea se face o singură dată, pe fișierul imagine: funcționează pe orice ecran,
+# nu depinde de driverul display-ului și nu afectează rotația desktopului.
+# (Image.Rotate din Plymouth păstrează dimensiunile originale și ar tăia imaginea.)
+ensure_pillow() {
+    python3 -c 'import PIL' >/dev/null 2>&1 && return 0
+    info "Instalez python3-pil (pachet Debian oficial) pentru rotirea imaginii..."
+    run apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends python3-pil \
+        || die "Instalarea python3-pil a eșuat." "Rulează 'sudo apt update' și încearcă din nou."
+}
+
+install_theme_image() {
+    local dest="${THEME_DIR}/splash.png"
+    if (( OPT_ROTATE == 0 )); then
+        run install -m 644 -- "${IMAGE}" "${dest}"
+        return 0
+    fi
+    command -v python3 >/dev/null 2>&1 || die "python3 lipsește; necesar pentru --rotate." "sudo apt install python3"
+    ensure_pillow
+    info "Rotesc imaginea cu ${OPT_ROTATE}° (sensul acelor de ceasornic)"
+    # PIL rotește în sens trigonometric: unghi negativ = sensul acelor de ceasornic; expand păstrează toată imaginea
+    run python3 -c 'import sys
+from PIL import Image
+Image.open(sys.argv[1]).rotate(-int(sys.argv[3]), expand=True).save(sys.argv[2], "PNG")' \
+        "${IMAGE}" "${dest}" "${OPT_ROTATE}"
+    run chmod 644 "${dest}"
+}
+
 create_theme() {
     info "Creez tema Plymouth '${THEME_NAME}' în ${THEME_DIR}"
     run install -d -m 755 "${THEME_DIR}"
-    run install -m 644 -- "${IMAGE}" "${THEME_DIR}/splash.png"
+    install_theme_image
     write_file "${THEME_DIR}/${THEME_NAME}.plymouth" "[Plymouth Theme]
 Name=Mixxx splash
 Description=Imagine personalizată la pornire (creată de ${SCRIPT_NAME})
@@ -278,7 +310,9 @@ edit_config() {
 enable_splash() {
     [[ -f "${IMAGE}" ]] || die "Imaginea nu există: ${IMAGE}" "Folosește --image /cale/catre/imagine.png"
     file -b "${IMAGE}" | grep -q '^PNG image' || die "Imaginea trebuie să fie PNG: ${IMAGE}" "Convertește-o în PNG și încearcă din nou."
-    ok "Imagine: ${IMAGE} ($(file -b "${IMAGE}" | cut -d, -f2 | xargs))"
+    local rot_info=""
+    (( OPT_ROTATE )) && rot_info=", rotire ${OPT_ROTATE}° în sensul acelor de ceasornic"
+    ok "Imagine: ${IMAGE} ($(file -b "${IMAGE}" | cut -d, -f2 | xargs))${rot_info}"
 
     info "Voi modifica: ${BOOT_DIR}/cmdline.txt, ${BOOT_DIR}/config.txt și tema Plymouth (cu copii de siguranță)."
     ask_yes_no "Continui?" || die "Anulat de utilizator."
@@ -336,6 +370,7 @@ revert_splash() {
 
 main() {
     parse_args "$@"
+    [[ "${OPT_ROTATE}" =~ ^(0|90|180|270)$ ]] || die "--rotate acceptă doar 0, 90, 180 sau 270 (primit: ${OPT_ROTATE})."
     if (( ! OPT_DRY_RUN )) && (( EUID != 0 )); then
         die "Sunt necesare privilegii root." "Rulează: sudo ./${SCRIPT_NAME}"
     fi
