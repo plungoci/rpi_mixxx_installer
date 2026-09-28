@@ -64,6 +64,7 @@ This writes `~/.config/autostart/mixxx-autostart.desktop`, the standard XDG auto
 ```bash
 sudo ./setup_boot_splash.sh                     # uses assets/splash.png
 sudo ./setup_boot_splash.sh --image my-logo.png # any PNG
+sudo ./setup_boot_splash.sh --rotate 90        # rotate the image clockwise (90/180/270)
 ./setup_boot_splash.sh --dry-run                # show changes only
 sudo ./setup_boot_splash.sh --revert            # undo everything
 ```
@@ -72,6 +73,8 @@ It changes three things:
 - **Plymouth:** installs Plymouth and adds a theme that centres the image, scaled to fit, on a black background.
 - **`cmdline.txt`:** adds `quiet splash loglevel=3 logo.nologo vt.global_cursor_default=0` and moves the console from `tty1` to `tty3`, so boot messages are hidden but still logged.
 - **`config.txt`:** sets `disable_splash=1`, which removes the rainbow screen.
+
+`--rotate` rotates the image file once when the theme is installed. It uses `python3-pil`, installed if missing. This works on any display, including the natively portrait Touch Display 2, and leaves the desktop rotation alone. If the logo comes out upside down, use `--rotate 270` instead of `90`.
 
 The original files are backed up once in `/var/lib/mixxx-installer/splash`, and `--revert` restores them. Reboot to see the change.
 
